@@ -1,0 +1,2 @@
+The goal of this project is to create a program which can simulate US House of Representative elections given arbitrarily-drawn districts. This tool will be used to examine how the US House of Representatives might look given various proposed solutions to gerrymandering - specifically, the shortest-splitline algorithm.
+This work is being completed through the UMass Dartmouth MTH463 - Mathematical Modeling class.
