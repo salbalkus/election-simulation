@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 import math as m
+import requests
 from scipy.spatial import Voronoi
 
 #May want to change these methods in the future to take in
@@ -121,17 +122,15 @@ districts_dict = {
  "Wyoming" : 1
         }
 
-def pop_data_read(path, state_name):
-    pop = pd.read_csv(path)
-    pop = pop.drop(0)
-    pop = pop.rename(columns = {"GEO_ID":"ID","NAME":"Name","B01003_001E":"Population","B01003_001M":"moe"})
-    state_pop = pop[pop.Name.str.contains(state_name)]
-    state_pop.Name = state_pop.Name.str[0:25]
-    state_pop.Name = state_pop.Name.str.strip()
-    state_pop.Population = state_pop.Population.astype(int)
-    return state_pop
+"""
+Below are the original file-reading functions that were used to read in downloaded data.
+These functions are old; instead, use the functions that access data from the Census API directly.
+"""
 
-def pop_data_read2(path):
+def pop_read_file(path):
+    """
+    Produces clean DataFrame of population data from downloaded US Census Bureau file.
+    """
     pop = pd.read_csv(path)
     pop = pop.drop(0)
     pop = pop.rename(columns = {"GEO_ID":"ID","NAME":"Name","B01003_001E":"Population","B01003_001M":"moe"})
@@ -141,7 +140,23 @@ def pop_data_read2(path):
     pop.loc[pop.Name.str.contains(" Town"), "Name"] = pop[pop.Name.str.contains(" Town")].Name.str[:-5]
     return pop
 
-def geo_data_read(district_path, state_path, state_name):
+def pop_read_file_state(path, state_name):
+    """
+    Produces clean DataFrame of population data from downloaded US Census Bureau file of state population.
+    """
+    pop = pd.read_csv(path)
+    pop = pop.drop(0)
+    pop = pop.rename(columns = {"GEO_ID":"ID","NAME":"Name","B01003_001E":"Population","B01003_001M":"moe"})
+    state_pop = pop[pop.Name.str.contains(state_name)]
+    state_pop.Name = state_pop.Name.str[0:25]
+    state_pop.Name = state_pop.Name.str.strip()
+    state_pop.Population = state_pop.Population.astype(int)
+    return state_pop
+
+def geo_read_file(district_path, state_path, state_name):
+    """
+    Produces clean GeoDataFrame of specified district from downloaded TIGER Database .shp file.
+    """
     geos = gpd.read_file(district_path)
     states = gpd.read_file(state_path)
     state_geo = geos[geos["STATEFP"] == fips_dict[state_name]]
@@ -150,11 +165,88 @@ def geo_data_read(district_path, state_path, state_name):
     state.loc[state.NAME_2.str.contains(" Town"), "NAME_2"] = state[state.NAME_2.str.contains(" Town")].NAME_2.str[:-5]
     return state
 
-def state_bound_read(state_path, state_name):
+def state_read_file(state_path, state_name):
+    """
+    Obtains boundary of specified state from downloaded TIGER Database .shp file.
+    """
     states = gpd.read_file(state_path)
     state = states[states.NAME == state_name]
     state = state[["NAME","geometry"]].reset_index(drop = True)
     return state
+
+"""
+The functions below obtain data directly from the US Census API.
+They are much easier to use, and are the functions used for the final analysis.
+"""
+
+def pop_read_api(state):
+    """
+    Obtains the population of each county subdivision of the specified state and performs data cleaning.
+    
+    INPUT: String of desired state name
+    
+    OUTPUT: DataFrame of population for each county subdivision
+    """
+    table = "S0101_C01_001E"
+    api_call = "https://api.census.gov/data/2018/acs/acs5/subject?get=NAME," + table + "&for=county%20subdivision:*&in=county:*+state:" + fips_dict[state]
+    pop = pd.DataFrame(requests.get(api_call).json())
+    
+    pop.columns = pop.loc[0]
+    pop = pop.drop(0)
+    
+    pop = pop.rename(columns = {"NAME":"Name","S0101_C01_001E":"Population"})
+    pop.Name = pop.Name.str.extract(r"([a-zA-Z -]*,)")[0].str[:-1]
+    pop.Name = pop.Name.str.strip()
+    pop.Population = pop.Population.astype(int)
+    pop.loc[pop.Name.str.contains(" Town"), "Name"] = pop[pop.Name.str.contains(" Town")].Name.str[:-5]
+    return pop
+    
+
+def state_read_api(state):
+    """
+    Obtains the shape file information of the specified state.
+    
+    INPUT: String of desired state name
+    OUTPUT: GeoDataFrame of the state
+    """
+    
+    api_call = "https://geo.dot.gov/server/rest/services/NTAD/States/MapServer/0/query?where=UPPER(STATEFP)%20like%20%27%25"+fips_dict[state]+"%25%27&outFields=*&outSR=4326&f=json"
+    resp = requests.get(api_call).json()
+    state = gpd.GeoDataFrame(resp["features"][0]["attributes"], index = [0], crs = {'init': 'epsg:4326'})
+    state["geometry"] = [shp.MultiPolygon([shp.Polygon(shape) for shape in resp["features"][0]["geometry"]["rings"]])]
+    
+    return state
+
+def geo_read_api(state):
+    """
+    Obtains the shape file information for each county subdivision of the specified state.
+    
+    INPUT: String of desired state name
+    OUTPUT: GeoDataFrame of shape file for each county subdivision
+    """
+    api_call = "https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Places_CouSub_ConCity_SubMCD/MapServer/find?searchText="+fips_dict[state]+"&contains=true&searchFields=STATE&sr=&layers=1&returnGeometry=true&f=json"
+    
+    resp = requests.get(api_call).json()
+    df = gpd.GeoDataFrame(columns = resp["results"][0]["attributes"].keys(), crs = {'init': 'epsg:3857'})
+    
+    geometries = []
+    for n, result in enumerate(resp["results"]):
+        df = df.append(pd.DataFrame(result["attributes"], index = [n]))
+        geometries.append(shp.MultiPolygon([shp.Polygon(shape) for shape in result["geometry"]["rings"]]))
+    
+    df["geometry"] = gpd.GeoSeries(geometries)   
+    df = df.to_crs({'init': 'epsg:4326'})
+
+    state_bound = state_read_api(state)
+    
+    return gpd.overlay(df, state_bound, how="intersection")
+
+
+
+"""
+The functions below are used to produce spatial point processes of varying densities.
+They are used to test the effects of point distribution on gerrymandering methods.
+"""
 
 def get_density(state_geo, state_pop, district_name):
     """
@@ -201,9 +293,14 @@ def uniform_density(geo, pop, district, density = 100000, file_name = "latest.sh
         intersection.to_file(file_name)
     return intersection
 
+"""
+The functions below produce spatial point processes within the boundary of each state using files saved to the user's computer.
+These functions are outdated; it is recommended to use the api functions, which are easier to call and do not required downloading.
+"""
+
 def district_spp(pop_path, geo_path, state_path, state, district, density_frac = 0.01, mask_plot = False):
-    pop = pop_data_read2(pop_path) #used to use the original pop_data_read
-    geo = geo_data_read(geo_path, state_path, state)
+    pop = pop_read_file(pop_path) #used to use the original pop_data_read
+    geo = geo_read_file(geo_path, state_path, state)
     density = get_density(geo, pop,district)
     region = uniform_density(geo, pop, district, density_frac * density )
     
@@ -212,8 +309,8 @@ def district_spp(pop_path, geo_path, state_path, state, district, density_frac =
     return region
 
 def state_spp(pop_path, geo_path, state_path, state, density_frac = 0.001, mask_plot = False, file_name = "latest_state.shp"):
-    pop = pop_data_read(pop_path, state)
-    geo = geo_data_read(geo_path, state_path, state)
+    pop = pop_read_file(pop_path, state)
+    geo = geo_read_file(geo_path, state_path, state)
     
     district = "Congressional District 1"
 
@@ -231,8 +328,8 @@ def state_spp(pop_path, geo_path, state_path, state, density_frac = 0.001, mask_
     return full_state
 
 def state_spp2(pop_path, geo_path, state_path, state, density_frac = 0.001, mask_plot = False, file_name = "latest_state.shp", sz = 1):
-    pop = pop_data_read2(pop_path)
-    geo = geo_data_read(geo_path, state_path, state)
+    pop = pop_read_file(pop_path)
+    geo = geo_read_file(geo_path, state_path, state)
     locations = pop.Name
     points = []
 
@@ -249,6 +346,18 @@ def state_spp2(pop_path, geo_path, state_path, state, density_frac = 0.001, mask
         
     full_state.to_file(file_name)
     return full_state
+
+"""
+These functions use the Census API to produce spatial point processes of the population of the specified state.
+"""
+
+def state_spp_api(state):
+    pop = pop_read_api(state)
+    geo = geo_read_api(state)
+    pass
+
+
+
 
 
 def knn_district(spp, state_boundary, state):
