@@ -14,6 +14,9 @@ import requests
 from scipy.spatial import Voronoi
 from random import random, uniform
 import os
+import geoplot
+import matplotlib.colors as mplc
+import matplotlib.pyplot as plt
 
 fips_dict = {
  "Alabama" : "01",
@@ -131,7 +134,9 @@ class StateSPP:
     They are much easier to use, and are the functions used for the final analysis.
     """
 
-    def __init__(self, state, api_key = "", file_name = "spp.shp"):
+    def __init__(self, state, api_key = "", spp_file = "spp.shp", vote_file = "", sim_file = "", voronoi_file = "", load_components = True):
+        #Note that the way that the constructor deals with files is a bit wonky and unintuitive if you haven't used it before.
+        #Since this project needs to be completed on time, this is not currently an issue I am concerned with right now.
         self.state = state
         self.api_key = api_key
         wd = os.getcwd()
@@ -139,22 +144,29 @@ class StateSPP:
             os.mkdir(self.state)
         self.wd = wd + "//" + state
         
-        if file_name in os.listdir(self.wd):
-            self.spp = gpd.read_file(self.wd + "//" + file_name)
-            self.spp = self.spp.drop("FID", axis = 1)
+        if spp_file in os.listdir(self.wd):
+            self.spp = gpd.read_file(self.wd + "//" + spp_file)
         else:
             self.spp = None
         
         self.boundary = self.state_read_api()
 
-        if api_key == "":
+        if load_components:
             self.pop = self.pop_read_api()
             self.geo = self.geo_read_api()
-        else:
-            self.pop = self.pop_read_api()
-            self.geo = self.geo_read_api()
-        
-        self.districts = self.districts_read_api()
+            
+        if vote_file != "":
+            #Make sure that the vote_file is in the same directory as this program file!
+            votes = pd.read_csv(vote_file)
+            self.votes = votes[votes.state == self.state]
+            self.districts = self.districts_read_api()
+            
+        if sim_file != "":
+            #Make sure that the sim_file is in the directory titled with the state name!
+            self.simulations = pd.read_csv(self.wd + "//" + sim_file,  header = [0,1], index_col = 0)
+        if voronoi_file != "":
+            #Make sure that the voronoi_file is in the directory titled with the state name!
+            self.redistricts = gpd.read_file(self.wd + "//" + voronoi_file)
         
         
     def save_progress(self, file_name = "spp.shp"):
@@ -491,14 +503,14 @@ class StateSPP:
         district_count = districts_dict[self.state]
         test_points = list(zip(self.spp.geometry.x, self.spp.geometry.y))
         v = Voronoi(test_points)
-        polygons = {}
-        for id, region_index in enumerate(v.point_region):
+        polygons = dict()
+        for i_d, region_index in enumerate(v.point_region):
             points = []
             for vertex_index in v.regions[region_index]:
                 if vertex_index != -1:  # the library uses this for infinity
                     points.append(list(v.vertices[vertex_index]))
             points.append(points[0])
-            polygons[id]=points
+            polygons[i_d]=points
         
         gons = []
         for n in range(len(polygons)):
@@ -517,13 +529,10 @@ class StateSPP:
         final = gpd.GeoDataFrame(geometry = districts).reset_index()
         final.columns = ["district","geometry"]
         final.to_file(self.wd + "//districts.shp")
-        self.districts = final
+        self.redistricts = final
         
-    def read_votes(self,file_path):
-        votes = pd.read_csv(file_path)
-        self.votes = votes[votes.state == self.state]
             
-    def assign_district_p(self, file_path):
+    def assign_district_p(self):
         """
         Assigns probabilities of party votes to each point in a spatial point process.
         Relies on a file from MIT Election Data providing the number of votes for each party in each congressional district in the 2018 election.
@@ -541,6 +550,8 @@ class StateSPP:
             district_votes = self.votes[self.votes.district == n][["votes","party"]]
             total_votes = sum(district_votes.votes)
             parties = list(district_votes.party)
+            if "democrat" in parties:
+                output.loc[points, "dem_p"] = float(district_votes[district_votes.party == "democrat"].iloc[0,0] / total_votes)
             if "democratic" in parties:
                 output.loc[points, "dem_p"] = float(district_votes[district_votes.party == "democratic"].iloc[0,0] / total_votes)
             if "republican" in parties:
@@ -549,28 +560,30 @@ class StateSPP:
                 output.loc[points, "lib_p"] = float(district_votes[district_votes.party == "libertarian"].iloc[0,0] / total_votes)
             if "green" in parties:
                 output.loc[points, "grn_p"] = float(district_votes[district_votes.party == "green"].iloc[0,0] / total_votes)
+            if "independent" in parties:
+                output.loc[points, "ind_p"] = float(district_votes[district_votes.party == "independent"].iloc[0,0] / total_votes)
         
         self.spp = output
     
-    def cast_vote(self):
+    def cast_vote(self, labeled_spp):
         """
         Casts a vote for a single population point randomly based on proportions of voters in the point's congressional district.
         Helper function for simulate_voting
         """
         x = random()
-        thresh = self.spp.dem_p
+        thresh = labeled_spp.dem_p
         if(x < thresh):
             return "democrat"
         else:
-            thresh += self.spp.rep_p
+            thresh += labeled_spp.rep_p
             if(x < thresh):
                 return "republican"
             else:
-                thresh += self.spp.lib_p
+                thresh += labeled_spp.lib_p
                 if(x < thresh):
                     return "libertarian"
                 else:
-                    thresh += self.spp.grn_p
+                    thresh += labeled_spp.grn_p
                     if(x < thresh):
                         return "green"
                     else:
@@ -581,27 +594,56 @@ class StateSPP:
         Simulates a possible election for a spatial point process based on voting proportions across the state for each congressional district.
         """
         output = self.spp.copy()
-        output["vote"] = output.apply(self.cast_vote, axis = 1,result_type = "expand")
+        output["vote"] = output.apply(self.cast_vote, axis = 1, result_type = "expand")
         return output
     
     def run_sims(self, file_name = "simulation.csv", sims = 10):
         """
         Runs many simulations and summarizes the number of votes for each in a Data Frame
         """
-        safe_spp = self.spp.copy()
-        sim = self.simulate_voting(safe_spp)
+        sim = self.simulate_voting()
         output = pd.DataFrame(sim.groupby(["district","vote"]).size()).T
-        for n in range(1,sims):
-            sim = self.simulate_voting(safe_spp)
+        for n in range(1,sims+1):
+            print("Running simulation " + str(n) + "...")
+            sim = self.simulate_voting()
             output = output.append(pd.DataFrame(sim.groupby(["district","vote"]).size()).T)
         
         output = output.reset_index()
-        output.to_csv(file_name)
+        output = output.drop(["index",-1], level = 0, axis = 1)
+        output.to_csv(self.wd + "//" + file_name)
         self.simulations = output
-    
+        
+    def average_vote(self):
+        total = self.simulations.groupby("district", axis = 1).sum().loc[0]
+        average_winning_party = (self.simulations.mean() / total).groupby("district").idxmax()
+        average_winning_pc = (self.simulations.mean() / total).groupby("district").max()
+        output = pd.DataFrame({"party": list(zip(*average_winning_party.values))[1], "votes": average_winning_pc.values}, index = average_winning_pc.index)
+        output.index = output.index.astype(int)
 
-
+        return output
     
+    def produce_plot(self):
+        df = gpd.GeoDataFrame(self.average_vote())
+        shapes = gpd.GeoDataFrame(self.redistricts)
+        shapes.district += 1
+        shapes = shapes.set_index("district")
+        df["geometry"] = shapes.geometry
+        
+        xmin = df.bounds.minx.min()
+        xmax = df.bounds.maxx.max()
+        ymin = df.bounds.miny.min()
+        ymax = df.bounds.maxy.max()
+                
+        norm = mplc.Normalize(vmin=0.4,vmax=1)
+        
+        fig = plt.figure()
+        if any("democrat" == df.party):
+            ax = plt.subplot(111)
+            ax = geoplot.choropleth(df[df.party == "democrat"], hue = "votes", norm = norm, cmap = "Blues", legend = True, ax = ax)
+        if any("republican" == df.party):
+            ax = geoplot.choropleth(df[df.party == "republican"], hue = "votes", norm = norm, cmap = "Reds", legend = True, ax = ax)
+        ax.set_xbound(lower = xmin, upper = xmax)
+        ax.set_ybound(lower = ymin, upper = ymax)
         
     
     
